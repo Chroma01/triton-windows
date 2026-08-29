@@ -112,6 +112,7 @@ Although technically Triton can be used alone, in the following let's assume you
 | 2.11 | 3.6 |
 | 2.12 | 3.7 |
 | 2.13 | 3.7 |
+| 2.14 | 3.8 |
 
 PyTorch 2.3 and older are not supported in this repo.
 
@@ -128,14 +129,15 @@ You can skip this.
 
 Since triton-windows post11, a minimal CUDA toolchain is bundled in the Triton wheels, so you don't need to manually install it.
 
-CUDA toolchain minor version bundled in each Triton minor version:
+ptxas version bundled in each Triton minor version:
 
-| Triton | CUDA |
+| Triton | ptxas |
 | --- | --- |
 | 3.1 .. 3.2 | 12.4 |
 | 3.3 .. 3.7 | 12.8 |
+| 3.8 | 12.9 |
 
-See [nvidia-toolchain-version.json](https://github.com/triton-lang/triton/blob/main/cmake/nvidia-toolchain-version.json) for the detailed versions.
+See [nvidia-toolchain-version.json](https://github.com/triton-lang/triton/blob/main/cmake/nvidia-toolchain-version.json) for the detailed versions of other components.
 
 If you need to override the CUDA toolchain, you can set the environment variable `CUDA_PATH`.
 </details>
@@ -251,13 +253,13 @@ If you've installed an old version of `triton`, first uninstall it:
 ```pwsh
 pip uninstall triton
 ```
-Now you can install `triton-windows 3.7`, or upgrade the already installed version. To prevent breaking with your installed PyTorch when a new version of Triton is released in future, you can limit the version to be < 3.8:
+Now you can install `triton-windows 3.8`, or upgrade the already installed version. To prevent breaking with your installed PyTorch when a new version of Triton is released in future, you can limit the version to be < 3.9:
 ```pwsh
-pip install -U "triton-windows<3.8"
+pip install -U "triton-windows<3.9"
 ```
 Note again that if you're using the embeded Python, then instead of directly run `pip`, you need:
 ```pwsh
-C:\path\to\python_embeded\python.exe -m pip install -U "triton-windows<3.8"
+C:\path\to\python_embeded\python.exe -m pip install -U "triton-windows<3.9"
 ```
 Or if you want `triton-windows 3.2`, then run:
 ```pwsh
