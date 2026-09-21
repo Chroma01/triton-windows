@@ -107,6 +107,37 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
+// CHECK-LABEL: @unary_loop_update
+// CHECK: %[[LOOP_RESULT:.*]] = scf.for
+// CHECK: %[[LOAD:.*]] = tt.load
+// CHECK-NEXT: %[[REDUCED:.*]] = "tt.reduce"(%[[LOAD]]) <{axis = 1 : i32}>
+// CHECK: %[[NEGATED:.*]] = arith.negf %[[REDUCED]]
+// CHECK-NEXT: scf.yield %[[NEGATED]]
+// CHECK: tt.store {{.*}}, %[[LOOP_RESULT]]
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 1, parent = #blocked}>
+module attributes {"ttg.target" = "cuda:89", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @unary_loop_update(%input: tensor<16x256x!tt.ptr<f32>, #blocked>, %output: tensor<16x!tt.ptr<f32>, #slice>, %count: i32) {
+    %zero = arith.constant dense<0.000000e+00> : tensor<16xf32, #slice>
+    %start = arith.constant 0 : i32
+    %step = arith.constant 1 : i32
+    %result = scf.for %index = %start to %count step %step iter_args(%accumulator = %zero) -> (tensor<16xf32, #slice>) : i32 {
+      %values = tt.load %input : tensor<16x256x!tt.ptr<f32>, #blocked>
+      %reduced = "tt.reduce"(%values) <{axis = 1 : i32}> ({
+      ^bb0(%left: f32, %right: f32):
+        %sum = arith.addf %left, %right : f32
+        tt.reduce.return %sum : f32
+      }) : (tensor<16x256xf32, #blocked>) -> tensor<16xf32, #slice>
+      %negated = arith.negf %reduced : tensor<16xf32, #slice>
+      scf.yield %negated : tensor<16xf32, #slice>
+    }
+    tt.store %output, %result : tensor<16x!tt.ptr<f32>, #slice>
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: @row_major_register_grouping
 // CHECK: %[[LOAD:.*]] = tt.load
 // CHECK-NEXT: %[[FACTORED:.*]] = tt.reshape %[[LOAD]] : {{.*}} -> tensor<{{8x2x32x4xf32.*}}>
@@ -883,4 +914,36 @@ tt.func @skip_optimize_on_1d_tensor(%arg0: tensor<256xf32, #blocked>, %arg1: ten
   tt.return %0 : tensor<8xf32, #blocked>
 }
 
+}
+
+// -----
+
+// CHECK-LABEL: tt.func @loop_result_multiple_uses(
+// CHECK: %[[FINAL_RESULT:.+]] = arith.addf {{.*}} : tensor<1xf32,
+// CHECK: arith.addf %[[FINAL_RESULT]], %[[FINAL_RESULT]]
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#slice = #ttg.slice<{dim = 1, parent = #blocked}>
+module attributes {"ttg.num-warps" = 1 : i32} {
+  tt.func @loop_result_multiple_uses(
+      %input: tensor<1x64x!tt.ptr<f32>, #blocked>,
+      %output: tensor<1x!tt.ptr<f32>, #slice>, %count: i32) {
+    %zero = arith.constant dense<0.0> : tensor<1xf32, #slice>
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %result = scf.for %i = %c0 to %count step %c1
+        iter_args(%acc = %zero) -> (tensor<1xf32, #slice>) : i32 {
+      %values = tt.load %input : tensor<1x64x!tt.ptr<f32>, #blocked>
+      %sum = "tt.reduce"(%values) <{axis = 1 : i32}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %add = arith.addf %lhs, %rhs : f32
+        tt.reduce.return %add : f32
+      }) : (tensor<1x64xf32, #blocked>) -> tensor<1xf32, #slice>
+      %next = arith.addf %acc, %sum : tensor<1xf32, #slice>
+      scf.yield %next : tensor<1xf32, #slice>
+    }
+    %twice = arith.addf %result, %result : tensor<1xf32, #slice>
+    tt.store %output, %twice : tensor<1x!tt.ptr<f32>, #slice>
+    tt.return
+  }
 }
