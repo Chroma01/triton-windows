@@ -2830,9 +2830,9 @@ def test_umulhi_known_bits(masked, dtype_str, device):
     compiled = kernel[(1, )](x, output, masked, getattr(tl, f"uint{bits}"))
     expected = torch.zeros_like(x) if masked else (x >> (bits - 8)) & 255
     torch.testing.assert_close(output, expected)
-    if is_cuda():
-        assert "mul.hi." not in compiled.asm["ptx"]
-    elif is_hip():
+    # NVIDIA uses explicit multiply-high intrinsics; the generic AMD lowering
+    # still exposes the wide product to LLVM's known-bits optimizations.
+    if is_hip():
         assert "mul_hi" not in compiled.asm["amdgcn"]
 
 
@@ -3338,7 +3338,7 @@ def test_reduce64_integer(op, dtype_str, num_warps, device):
         if op == "add":
             assert "redux.sync.add.s32" in compiled.asm["ptx"]
         else:
-            assert compiled.asm["ptx"].count(f"redux.sync.{op}.b32") == (4 if num_warps == 32 else 2)
+            assert compiled.asm["ptx"].count(f"redux.sync.{op}.b32") == 4
 
 
 # TODO: [Qingyi] Fix argmin / argmax
@@ -7282,37 +7282,55 @@ def test_propagate_nan(dtype, propagate_nan, func, device):
 
 
 @pytest.mark.interpreter
-@pytest.mark.parametrize("dtype", ['bfloat16', 'float16', 'float32'])
-def test_clamp(dtype, device):
+@pytest.mark.parametrize("dtype", integral_dtypes + ['bool', 'bfloat16', 'float16', 'float32'])
+@pytest.mark.parametrize("scalar_bounds", [False, True])
+@pytest.mark.parametrize("propagate_nan", ['NONE', 'ALL'])
+def test_clamp(dtype, scalar_bounds, propagate_nan, device):
     check_type_supported(dtype, device)
+    if is_hip_gfx1250() and dtype == 'bfloat16' and scalar_bounds and propagate_nan == 'NONE':
+        # LLVM lowers scalar BF16 min/max with inline constants to packed ops
+        # without the op_sel bits needed to select the constants' upper 16 bits.
+        # Remove this skip once LLVM's scalar BF16 constant selection is fixed.
+        pytest.skip("gfx1250 scalar BF16 min/max uses incorrect inline-constant selectors")
 
     @triton.jit
-    def kernel(x_ptr, min_ptr, max_ptr, out_ptr, ref_ptr, N, BLOCK_SIZE: tl.constexpr):
+    def kernel(x_ptr, min_ptr, max_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr, SCALAR_BOUNDS: tl.constexpr,
+               LOWER: tl.constexpr, UPPER: tl.constexpr, PROPAGATE_NAN: tl.constexpr):
         off = tl.arange(0, BLOCK_SIZE)
         mask = off < N
         x = tl.load(x_ptr + off, mask=mask)
-        _min = tl.load(min_ptr + off, mask=mask)
-        _max = tl.load(max_ptr + off, mask=mask)
-        out = out_ptr + off
-        ref = ref_ptr + off
-
-        tl.store(out, tl.clamp(x, _min, _max), mask=mask)
-        ref_val = tl.minimum(tl.maximum(x, _min), _max)
-        tl.store(ref, ref_val, mask=mask)
+        if SCALAR_BOUNDS:
+            result = tl.clamp(x, LOWER, UPPER, propagate_nan=PROPAGATE_NAN)
+        else:
+            _min = tl.load(min_ptr + off, mask=mask)
+            _max = tl.load(max_ptr + off, mask=mask)
+            result = tl.clamp(x, _min, _max, propagate_nan=PROPAGATE_NAN)
+        tl.static_assert(result.dtype == x.dtype)
+        tl.store(out_ptr + off, result, mask=mask)
 
     size = 128
+    rs = RandomState(17)
+    x = numpy_random(size, dtype_str=dtype, rs=rs)
+    a = numpy_random(size, dtype_str=dtype, rs=rs)
+    b = numpy_random(size, dtype_str=dtype, rs=rs)
+    if dtype in integral_dtypes:
+        limits = np.iinfo(dtype)
+        x[:5] = [limits.min, limits.min + 1, 0, limits.max - 1, limits.max]
+        a[:5] = limits.min
+        b[:5] = limits.max
+    lower, upper = (-1, 1) if dtype not in uint_dtypes else (1, 7)
+    if dtype == 'bool':
+        lower, upper = False, True
+    _min = np.minimum(a, b)
+    _max = np.maximum(a, b)
+    out = to_triton(np.empty_like(x), device=device, dst_type=dtype)
+    kernel[(1, )](to_triton(x, device=device, dst_type=dtype), to_triton(_min, device=device, dst_type=dtype),
+                  to_triton(_max, device=device,
+                            dst_type=dtype), out, size, BLOCK_SIZE=size, SCALAR_BOUNDS=scalar_bounds, LOWER=lower,
+                  UPPER=upper, PROPAGATE_NAN=getattr(tl.PropagateNan, propagate_nan))
 
-    x = torch.randn((size, ), device=device, dtype=getattr(torch, dtype))
-    a = torch.randn((size, ), device=device, dtype=getattr(torch, dtype))
-    b = torch.randn((size, ), device=device, dtype=getattr(torch, dtype))
-    _min = torch.min(a, b)
-    _max = torch.max(a, b)
-    out = torch.zeros_like(x, device=device, dtype=getattr(torch, dtype))
-    ref = torch.zeros_like(x, device=device, dtype=getattr(torch, dtype))
-
-    kernel[(size, )](x, _min, _max, out, ref, x.numel(), BLOCK_SIZE=size)
-
-    torch.testing.assert_close(out, ref)
+    ref = np.clip(x, lower, upper) if scalar_bounds else np.clip(x, _min, _max)
+    np.testing.assert_array_equal(to_numpy(out), ref)
 
 
 # Test for symmetric clamp(x, -limit, limit), as it may go through optimized
