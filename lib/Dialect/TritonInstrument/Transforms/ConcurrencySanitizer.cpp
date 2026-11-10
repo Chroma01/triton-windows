@@ -135,6 +135,13 @@ int getCurrentThread(Operation *op, const ConSanTargetHooks &hooks,
     thread += threadLayout.clcThreadOffset;
     return thread;
   }
+  if (hooks.usesAsyncCopyMbarrierArriveThread(op)) {
+    assert(threadLayout.hasAsyncCopyMbarrierArriveThreads() &&
+           "AsyncCopyMbarrierArrive thread class must exist when "
+           "instrumenting an async-copy mbarrier arrive op");
+    thread += threadLayout.asyncCopyMbarrierArriveThreadOffset;
+    return thread;
+  }
   return thread;
 }
 
@@ -142,10 +149,10 @@ int getBaseThread(int thread, const AuxDataMap::ThreadLayout &threadLayout) {
   return thread % threadLayout.numBaseThreads;
 }
 
-// Peer threads are the equivalent threads in the TMA, TC, CLC and normal
-// thread classes.
-// If a thread is a base thread, return the mask with the peers, otherwise
-// return the mask with the thread itself.
+// Peer threads are the equivalent threads in the TMA, TC, CLC,
+// AsyncCopyMbarrierArrive and normal thread classes. If a thread is a base
+// thread, return the mask with the peers, otherwise return the mask with the
+// thread itself.
 uint64_t getThreadPeersMask(int thread,
                             const AuxDataMap::ThreadLayout &threadLayout) {
   uint64_t mask = 1ULL << thread;
@@ -156,6 +163,9 @@ uint64_t getThreadPeersMask(int thread,
       mask |= 1ULL << (thread + threadLayout.tcThreadOffset);
     if (threadLayout.hasCLCThreads())
       mask |= 1ULL << (thread + threadLayout.clcThreadOffset);
+    if (threadLayout.hasAsyncCopyMbarrierArriveThreads())
+      mask |=
+          1ULL << (thread + threadLayout.asyncCopyMbarrierArriveThreadOffset);
   }
   return mask;
 }
@@ -553,10 +563,12 @@ SmallVector<uint16_t> getTensorCoreBarrierBroadcastMasks(Operation *op) {
 }
 
 LinearLayout getLocalLoadStoreConversion(ttg::MemDescType memDescTy,
-                                         RankedTensorType regTy) {
+                                         RankedTensorType regTy, bool isStore) {
   auto kBlock = StringAttr::get(memDescTy.getContext(), "block");
-  return invertAndComposeLocal(ttg::toLinearLayoutIgnoringPadding(memDescTy),
-                               ttg::toLinearLayout(regTy), {kBlock});
+  auto sharedLayout = ttg::toLinearLayoutIgnoringPadding(memDescTy);
+  auto regLayout = ttg::toLinearLayout(regTy);
+  return isStore ? invertAndComposeStore(sharedLayout, regLayout)
+                 : invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
 }
 
 LinearLayout getLocalGatherScatterConversion(ttg::MemDescType memDescTy,
@@ -653,13 +665,14 @@ Value getLocalMemoryRecipientCTAs(ImplicitLocOpBuilder &b,
 
 Value getLocalLoadStoreRecipientCTAs(ImplicitLocOpBuilder &b,
                                      ttg::MemDescType memDescTy,
-                                     RankedTensorType regTy) {
+                                     RankedTensorType regTy,
+                                     bool isStore = false) {
   // Layout-less tensors can appear in intermediate/test IR but cannot encode a
   // cross-CTA ownership mapping. Preserve the existing current-CTA behavior.
   if (!regTy.getEncoding())
     return currentCTAMask(b);
   return getLocalMemoryRecipientCTAs(
-      b, getLocalLoadStoreConversion(memDescTy, regTy));
+      b, getLocalLoadStoreConversion(memDescTy, regTy, isStore));
 }
 
 Value getScratchReadCTAs(ImplicitLocOpBuilder &b, Operation *op,
@@ -695,15 +708,16 @@ Value getMemEffectCTAs(ImplicitLocOpBuilder &b, Operation *op) {
   }
   if (auto store = dyn_cast<ttg::LocalStoreOp>(op)) {
     return getLocalLoadStoreRecipientCTAs(b, store.getDst().getType(),
-                                          store.getSrc().getType());
+                                          store.getSrc().getType(),
+                                          /*isStore=*/true);
   }
   if (auto store = dyn_cast<ttng::AsyncSharedStoreOp>(op)) {
     return getLocalLoadStoreRecipientCTAs(b, store.getDst().getType(),
                                           store.getSrc().getType());
   }
   if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op); alloc && alloc.getSrc()) {
-    return getLocalLoadStoreRecipientCTAs(b, alloc.getType(),
-                                          alloc.getSrc().getType());
+    return getLocalLoadStoreRecipientCTAs(
+        b, alloc.getType(), alloc.getSrc().getType(), /*isStore=*/true);
   }
   if (auto gather = dyn_cast<ttg::LocalGatherOp>(op)) {
     return getLocalMemoryRecipientCTAs(

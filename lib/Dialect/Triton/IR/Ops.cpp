@@ -9,6 +9,7 @@
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Interfaces/Utils/InferIntRangeCommon.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
@@ -135,35 +136,12 @@ LogicalResult LoadOp::verify() {
                            CachePolicyOperation::Load);
 }
 
-// load(ptr, splat(1), ...)        -> load(ptr, ...)
-// load(ptr, splat(0), other, ...) -> other
-struct CanonicalizeMaskedLoadPattern : public OpRewritePattern<LoadOp> {
-  CanonicalizeMaskedLoadPattern(MLIRContext *context)
-      : OpRewritePattern<LoadOp>(context, 1) {}
-
-  LogicalResult matchAndRewrite(LoadOp loadOp,
-                                PatternRewriter &rewriter) const override {
-    auto mask = loadOp.getMask();
-    if (!mask)
-      return failure();
-
-    if (matchPattern(mask, m_One())) {
-      rewriter.replaceOpWithNewOp<LoadOp>(
-          loadOp, loadOp.getType(), loadOp.getPtr(), Value(), Value(),
-          loadOp.getCachePolicyAttr(), loadOp.getIsVolatile());
-      return success();
-    }
-    // Without "other", a false-masked load produces an undefined value.
-    if (!matchPattern(mask, m_Zero()) || !loadOp.getOther())
-      return failure();
-    rewriter.replaceOp(loadOp, loadOp.getOther());
-    return success();
-  }
-};
-
-void LoadOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                         MLIRContext *context) {
-  results.add<CanonicalizeMaskedLoadPattern>(context);
+LogicalResult LoadOp::canonicalize(LoadOp op, PatternRewriter &rewriter) {
+  // Without "other", a false-masked load produces an undefined value.
+  if (!op.getOther() || !op.getMask() || !matchPattern(op.getMask(), m_Zero()))
+    return failure();
+  rewriter.replaceOp(op, op.getOther());
+  return success();
 }
 
 //-- StoreOp --
@@ -190,25 +168,9 @@ LogicalResult StoreOp::verify() {
                            CachePolicyOperation::Store);
 }
 
-// store(ptr, value, splat(1), ...) -> store(ptr, value, ...)
-// store(ptr, value, splat(0), ...) -> [none]
-struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
-  CanonicalizeMaskedStorePattern(MLIRContext *context)
-      : OpRewritePattern<StoreOp>(context, 1) {}
-
-  LogicalResult matchAndRewrite(StoreOp storeOp,
-                                PatternRewriter &rewriter) const override {
-    if (succeeded(eraseIfPredicateIsFalse(storeOp, rewriter)))
-      return success();
-    auto mask = storeOp.getMask();
-    if (!mask || !matchPattern(mask, m_One()))
-      return failure();
-    rewriter.replaceOpWithNewOp<StoreOp>(
-        storeOp, storeOp.getPtr(), storeOp.getValue(), Value(),
-        storeOp.getCachePolicyAttr(), storeOp.getIgnoreCta());
-    return success();
-  }
-};
+LogicalResult StoreOp::canonicalize(StoreOp op, PatternRewriter &rewriter) {
+  return eraseIfPredicateIsFalse(op, rewriter);
+}
 
 Value AtomicRMWOp::getPredicateOperand() { return getMask(); }
 
@@ -217,6 +179,15 @@ void AtomicRMWOp::setPredicateOperand(Value pred) {
 }
 
 Type AtomicRMWOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
+LogicalResult AtomicRMWOp::verify() {
+  RMWOp op = getAtomicRmwOp();
+  if ((op == RMWOp::AND || op == RMWOp::OR || op == RMWOp::XOR) &&
+      !isa<IntegerType>(getElementTypeOrSelf(getVal().getType())))
+    return emitOpError() << stringifyRMWOp(op)
+                         << " requires an integer element type";
+  return success();
+}
 
 Value AtomicLoadOp::getPredicateOperand() { return getMask(); }
 
@@ -270,11 +241,6 @@ LogicalResult AtomicPollOp::verify() {
     return emitOpError(
         "only supports integer elements with width {16, 32, 64}");
   return success();
-}
-
-void StoreOp::getCanonicalizationPatterns(RewritePatternSet &results,
-                                          MLIRContext *context) {
-  results.add<CanonicalizeMaskedStorePattern>(context);
 }
 
 //-- TransOp --
@@ -582,6 +548,31 @@ int32_t DotScaledOp::deduceScaleFactor() {
 }
 
 //-- MakeRangeOp --
+void MakeRangeOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                              MLIRContext *ctx) {
+  // Fold a comparison with a constant when every element gives the same result.
+  patterns.add(+[](arith::CmpIOp op, PatternRewriter &rewriter) {
+    auto range = op.getLhs().getDefiningOp<MakeRangeOp>();
+    APInt bound;
+    if (!range || !matchPattern(op.getRhs(), m_ConstantInt(&bound)))
+      return failure();
+
+    // make_range has signed i32 endpoints and excludes end.
+    auto values = ConstantIntRanges::fromSigned(
+        range.getStartAttr().getValue(), range.getEndAttr().getValue() - 1);
+    auto result = intrange::evaluatePred(
+        static_cast<intrange::CmpPredicate>(op.getPredicate()), values,
+        ConstantIntRanges::constant(bound));
+    if (!result)
+      return failure();
+
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(
+        op, DenseElementsAttr::get(cast<ShapedType>(op.getType()),
+                                   rewriter.getBoolAttr(*result)));
+    return success();
+  });
+}
+
 OpFoldResult MakeRangeOp::fold(FoldAdaptor adaptor) {
   // make_range(start, start + 1) -> constant(start)
   if (adaptor.getStart() + 1 == adaptor.getEnd()) {
@@ -1893,7 +1884,11 @@ LogicalResult verifyDescriptorLoadStoreOp(Operation *op,
                                           TensorDescInterface desc,
                                           ShapedType tensor) {
   RankedTensorType block = desc.getSignlessBlockType();
-  if (block.getElementType() != tensor.getElementType()) {
+  if (isFP6(block.getElementType())) {
+    if (!isa<DescriptorStoreOp>(op) || !tensor.getElementType().isInteger(8))
+      return op->emitOpError(
+          "packed FP6 descriptors require stores of i8 codes");
+  } else if (block.getElementType() != tensor.getElementType()) {
     return op->emitOpError("descriptor block and tensor element types must "
                            "match, but got descriptor element type ")
            << block.getElementType() << " and tensor element type "
